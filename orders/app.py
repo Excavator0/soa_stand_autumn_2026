@@ -1,4 +1,4 @@
-"""Orders — оформление заказа с одной оплатой.
+"""Orders — оформление заказа с одной оплатой и событием order.paid.
 
 Покупатель получает ответ на POST /orders не позже чем через секунду.
 Если исход платежа ещё не известен, ответ pending, а заказ дожимается в фоне.
@@ -15,6 +15,14 @@ GET /payments?order_id= — тогда заказ становится paid бе
 
 Отказ банка (402) — единственная причина отклонить заказ: резерв снимается,
 статус rejected. 500 и обрыв — не отказ, попытка повторяется.
+
+Событие order.paid пишется в outbox в той же транзакции, что и статус paid.
+id события постоянный: повторная публикация после обрыва или перезапуска —
+копия, а не новое событие. Пока шина не ответила 202, строка остаётся
+неопубликованной и её подхватывает фон, в том числе после kill -9.
+
+delivery.confirmed начисляет бонусы один раз: id события хранится в базе.
+Повтор и параллельная копия отвечают 200 и баланс не меняют.
 """
 
 import json
@@ -45,6 +53,8 @@ GET_TIMEOUT = 0.3
 RESERVE_HANDLER = 0.4
 RESERVE_WORKER = 2.0
 SLOW_CAP = 8.0
+# Короткий вызов шины: висящий запрос во время отказа не держит публикацию.
+BUS_TIMEOUT = 0.4
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orders")
@@ -61,6 +71,19 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS bonuses (
     user_id TEXT PRIMARY KEY,
     points  BIGINT NOT NULL
+);
+-- Событие создаётся вместе со статусом paid. published_at пустой, пока шина не приняла его.
+CREATE TABLE IF NOT EXISTS outbox (
+    order_id     TEXT PRIMARY KEY REFERENCES orders(id),
+    event_id     TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,
+    published_at TIMESTAMPTZ
+);
+-- Входящая доставка. Повтор с тем же event_id бонусы не добавляет.
+CREATE TABLE IF NOT EXISTS delivery_events (
+    event_id TEXT PRIMARY KEY,
+    user_id  TEXT NOT NULL,
+    points   BIGINT NOT NULL
 )
 """
 
@@ -405,9 +428,23 @@ def get_payment(order_id, timeout):
 
 
 def mark_paid(order_id):
-    if set_status(order_id, "paid"):
-        log.info("order %s: paid", order_id)
-        publish_paid(order_id)
+    """paid и outbox — одна транзакция: падение между ними не теряет событие."""
+    event_id = str(uuid.uuid4())
+    occurred_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "UPDATE orders SET status = 'paid' WHERE id = %s AND status = 'pending' RETURNING id",
+                (order_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "INSERT INTO outbox (order_id, event_id, occurred_at) VALUES (%s, %s, %s)",
+                (order_id, event_id, occurred_at),
+            )
+    log.info("order %s: paid", order_id)
+    return True
 
 
 def mark_rejected(order_id):
@@ -545,35 +582,83 @@ def create_order(body):
         state.end(order_id)
 
 
-def publish_paid(order_id):
-    """Сообщает в шину, что заказ оплачен. Не задерживает ответ покупателю."""
-    if not EVENTS_URL:
-        return
-    threading.Thread(target=_publish_paid, args=(order_id,), daemon=True).start()
-
-
-def _publish_paid(order_id):
+def publish_once(order_id, event_id, occurred_at):
     try:
         code, _ = call("POST", f"{EVENTS_URL}/events", {
-            "id": str(uuid.uuid4()),
+            "id": event_id,
             "type": "order.paid",
             "order_id": order_id,
-            "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }, timeout=0.5)
-        if code != 202:
-            log.warning("order %s: событие не опубликовано (%s)", order_id, code)
-    except Exception as e:
-        log.warning("order %s: событие не опубликовано (%s)", order_id, e)
+            "occurred_at": occurred_at,
+        }, timeout=BUS_TIMEOUT)
+    except TransportError as e:
+        log.info("order %s: шина без ответа (%s)", order_id, e)
+        return False
+    if code == 202:
+        return True
+    log.info("order %s: шина %s", order_id, code)
+    return False
 
 
-def delivery_confirmed(event):
-    """Начисляет бонусы за подтверждённую доставку."""
+def publish_step():
+    """Одна пачка outbox. 'down' — шина не приняла, id события не меняем."""
+    if not EVENTS_URL:
+        return "idle"
     with db() as conn:
-        conn.execute(
-            "INSERT INTO bonuses (user_id, points) VALUES (%s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET points = bonuses.points + EXCLUDED.points",
-            (event["user_id"], event["bonus_points"]),
-        )
+        rows = conn.execute(
+            """SELECT o.order_id, o.event_id, o.occurred_at
+               FROM outbox o
+               JOIN orders r ON r.id = o.order_id
+               WHERE o.published_at IS NULL AND r.status = 'paid'
+               ORDER BY o.occurred_at
+               LIMIT 20"""
+        ).fetchall()
+    if not rows:
+        return "idle"
+    for order_id, event_id, occurred_at in rows:
+        if not publish_once(order_id, event_id, occurred_at):
+            return "down"
+        with db() as conn:
+            conn.execute(
+                "UPDATE outbox SET published_at = now() WHERE order_id = %s AND published_at IS NULL",
+                (order_id,),
+            )
+        log.info("order %s: событие %s опубликовано", order_id, event_id)
+    return "ok"
+
+
+def publish_loop():
+    while True:
+        try:
+            result = publish_step()
+        except Exception:
+            log.exception("шина")
+            time.sleep(0.2)
+            continue
+        if result == "down":
+            time.sleep(0.2)
+        elif result == "idle":
+            time.sleep(0.05)
+
+
+def delivery_confirmed(event_id, user_id, points):
+    """Бонусы за событие — один раз. Повторная доставка того же id ничего не добавляет."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.transaction():
+            row = conn.execute(
+                """INSERT INTO delivery_events (event_id, user_id, points)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (event_id) DO NOTHING
+                   RETURNING event_id""",
+                (event_id, user_id, points),
+            ).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                """INSERT INTO bonuses (user_id, points) VALUES (%s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET points = bonuses.points + EXCLUDED.points""",
+                (user_id, points),
+            )
 
 
 def get_bonus(user_id):
@@ -640,11 +725,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "internal", "message": str(e)})
 
     def webhook(self, body):
-        if not isinstance(body, dict) or not isinstance(body.get("user_id"), str) \
-                or not isinstance(body.get("bonus_points"), int) or body["bonus_points"] <= 0:
+        if not isinstance(body, dict):
+            return self.send_json(400, {"error": "bad_request"})
+        event_id = body.get("id")
+        user_id = body.get("user_id")
+        points = body.get("bonus_points")
+        if not isinstance(event_id, str) or not event_id \
+                or not isinstance(user_id, str) or not user_id \
+                or isinstance(points, bool) or not isinstance(points, int) or points <= 0:
             return self.send_json(400, {"error": "bad_request"})
         try:
-            delivery_confirmed(body)
+            delivery_confirmed(event_id, user_id, points)
         except Exception as e:
             log.exception("POST /webhooks/delivery")
             return self.send_json(500, {"error": "internal", "message": str(e)})
@@ -657,6 +748,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=worker_loop, name="orders-settle", daemon=True).start()
+    threading.Thread(target=publish_loop, name="orders-outbox", daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     log.info("orders: слушаю :%d", PORT)
